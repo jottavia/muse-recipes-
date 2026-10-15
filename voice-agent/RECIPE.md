@@ -1,155 +1,167 @@
 # Voice Agent Recipe: Twilio + Whisper + LLM + TTS
 
-A pattern for giving an AI agent a telephone voice. Two variants: the
-agent itself as the brain (slow, simple) and a fast cloud model as the
-brain (real-time, more moving parts).
+A pattern for giving an AI agent a telephone voice. Three variants:
+turn-based with the agent as brain (slow, no public server needed),
+Twilio ConversationRelay with a fast cloud brain (recommended for
+real-time), and raw Media Streams (most control, most work).
 
 ## What it does
 
 A caller dials a Twilio number and has a spoken conversation. Speech is
-transcribed locally, a language model thinks of a reply, and the reply is
-spoken back on the call.
+transcribed, a language model thinks of a reply, and the reply is spoken
+back on the call.
 
-## Architecture
+## Variant 1: Turn-based (agent as brain, no public server)
+
+The simplest thing that works. No websocket, no public endpoint — just
+the Twilio REST API from any machine.
 
 ```
-Caller --(audio)--> Twilio --(Media Streams wss)--> Voice Server
-                                                          |
-Voice Server --(mulaw 8kHz)--> Whisper (STT, local) --> text
-                                                          |
-                        text --> Brain (LLM) --> reply text
-                                                          |
-Voice Server <--(mulaw 8kHz)-- TTS <-- reply text
-                                                          |
-Caller <--(audio)-- Twilio <--(Media Streams wss)-- Voice Server
+Call --> <Say>prompt</Say> --> <Record maxLength=10> --> hangup
+                                                      |
+Poll Recordings API --> download wav --> Whisper --> text --> agent
+                                                                      |
+                                              agent reply --> next call
+                                              (or redirect live call)
 ```
 
-## Components
+Tested end-to-end 2026-10-15: outbound call placed, prompt spoken,
+10s reply recorded, audio downloaded, transcribed with local Whisper
+tiny, all from a sandboxed VM with no inbound networking.
 
-### Telephony: Twilio
+**Latency:** 20-40s per turn (polling + transcription + agent thinking).
+Voicemail-like, not conversational.
 
-- One Twilio number with Voice enabled. Outbound calls need no public
-  infrastructure: the REST API accepts inline TwiML.
-- Two-way audio needs **Twilio Media Streams**, which requires a publicly
-  reachable `wss://` endpoint. A sandboxed VM without inbound networking
-  cannot host this; use a small public server (e.g. Oracle Cloud free tier).
+**To keep a dialog going** on one call instead of hanging up, redirect
+the live call with new TwiML before `<Record>` ends:
 
-Outbound speaking (no public endpoint needed):
-
-```python
-# POST /2010-04-01/Accounts/{SID}/Calls.json
-{"To": "+15551234567", "From": "+15559876543",
- "Twiml": "<Response><Say>Hello.</Say></Response>"}
+```
+POST /2010-04-01/Accounts/{SID}/Calls/{CallSid}.json
+{"Twiml": "<Response><Say>...</Say><Record maxLength=\"10\"/></Response>"}
 ```
 
-Two-way audio (public `wss://` required):
+### Voice
+
+Twilio's `<Say>` defaults to a female voice. For a male voice at zero
+extra latency, use an Amazon Polly voice:
+
+```xml
+<Say voice="Polly.Matthew">Hello.</Say>
+```
+
+No audio hosting, no extra delay — it's still Twilio's infrastructure.
+
+### Transcription accuracy
+
+Whisper `tiny` on phone audio is fast but lossy. Real example:
+said "why are you still speaking in a woman's voice", heard as
+"how come you're still using one of the boys". For anything that
+matters, use `base` or a cloud STT.
+
+## Variant 2: ConversationRelay (recommended for real-time)
+
+Twilio's managed facility for voice AI. Twilio handles STT, TTS, and
+barge-in; your server just exchanges **text** over a websocket.
 
 ```xml
 <Response>
-  <Stream url="wss://voice.example.com/stream"/>
+  <Connect>
+    <ConversationRelay url="wss://your-server/ws"/>
+  </Connect>
 </Response>
 ```
 
+WebSocket protocol (JSON): Twilio sends `setup`, `prompt` (transcribed
+speech), `interrupt`, `dtmf`. You reply with
+`{"type": "text", "token": "...", "last": true}` and Twilio speaks it.
+Stream tokens with `last: false` for lower latency.
+
+Your server is trivial: receive text → call LLM → send text back. No
+audio processing at all. Bring any LLM (OpenRouter works).
+
+**Latency:** Twilio reports median under 0.5s for their side; total
+~1-2s with a fast model.
+
+**Cost:** $0.07/min on top of the call (vs $0.0044/min for raw Media
+Streams). The premium buys you out of the entire audio pipeline.
+
+## Variant 3: Raw Media Streams (most control)
+
+Twilio streams raw mulaw 8kHz audio over `wss://`; you do STT, LLM, and
+TTS yourself.
+
+```
+Caller --(audio)--> Twilio --(Media Streams wss)--> Voice Server
+Voice Server --(mulaw 8kHz)--> Whisper (STT) --> text --> LLM --> TTS
+Voice Server --(mulaw 8kHz)--> Twilio --(audio)--> Caller
+```
+
 Media Streams sends JSON frames: `connected`, `start`, `media` (base64
-mulaw 8kHz), `stop`. Send `media` frames back to play audio to the caller.
+mulaw 8kHz), `stop`. Send `media` frames back to play audio.
 
-### Ears: Whisper (local)
-
-`faster-whisper`, `tiny` model, int8 on CPU. Tested: 2.8s of audio
-transcribed in 1.2s on 2 vCPUs. Free, private, no API calls.
-
-```python
-from faster_whisper import WhisperModel
-m = WhisperModel("tiny", device="cpu", compute_type="int8")
-segs, _ = m.transcribe(audio_float32_16khz, beam_size=1)
-text = " ".join(s.text for s in segs).strip()
-```
-
-Feed it 16kHz mono float32. Twilio sends 8kHz mulaw; convert with
-`audioop.ulaw2lin` then resample.
-
-### Mouth: TTS
-
-Any TTS that can output audio convertible to 8kHz mulaw. Tested path:
-cloud TTS to WAV, strip ID3 header, `audioop.ratecv` to 8kHz,
-`audioop.lin2ulaw`. Male voices available; voice is swappable per call.
-
-### Brain, variant A: Agent (the assistant itself)
-
-Pipe the transcript to the agent, take its reply, speak it.
-
-**How:** the voice server writes each transcript to a queue. A scheduled
-job (or the agent's own loop) picks it up, the assistant responds in chat or
-writes the reply to a file, the server speaks it on the call.
-
-**Latency:** 20-30 seconds per turn. The assistant's inference loop is built
-for thoughtful tool-using work, not real-time chat. Each turn also needs
-a wake-up (poll interval).
-
-**When it fits:** voicemail-style exchanges, async voice memos, anything
-where the caller tolerates a long pause. It does not fit a live
-conversation.
-
-**When it doesn't:** real-time back-and-forth. The caller will hang up.
-
-### Brain, variant B: fast cloud model
-
-A small model behind a fast API (e.g. via OpenRouter: GPT-4o-mini, Groq
-Llama). The voice server calls it directly over HTTPS.
-
-```python
-# pseudo-code
-reply = llm.chat(
-    model="openai/gpt-4o-mini",
-    messages=[{"role": "system", "content": SYSTEM_PROMPT},
-              *history, {"role": "user", "content": transcript}],
-    max_tokens=60,
-)
-```
-
-**Latency:** 1-2s for the brain. Total per turn: 3-5s (STT ~1s, brain
-~1-2s, TTS ~1-2s). Noticeable pause, workable.
-
-**To reach ~1s** (human-like): stream everything. Streaming STT
-(Deepgram), streaming LLM tokens (Groq), streaming TTS — each stage starts
-before the previous finishes. More engineering, more cost, audio leaves
-your infrastructure.
+**To reach ~1s** (human-like): stream everything — streaming STT
+(Deepgram), streaming LLM tokens (Groq), streaming TTS — each stage
+starting before the previous finishes. More engineering, more cost,
+audio leaves your infrastructure.
 
 ## Latency and cost cheat sheet
 
 | Setup | Per-turn latency | Cost per 5-min call |
 |---|---|---|
-| Agent as brain (async) | 20-30s | ~$0.05 (Twilio only) |
-| Fast brain, batch pipeline | 3-5s | ~$0.05-0.15 |
-| Fast brain, streaming pipeline | ~1-1.5s | ~$0.50-1.00 |
+| Turn-based, agent brain | 20-40s | ~$0.05 (Twilio only) |
+| ConversationRelay + fast LLM | ~1-2s | ~$0.40 (Twilio $0.35 + LLM) |
+| Raw streams, batch pipeline | 3-5s | ~$0.05-0.15 |
+| Raw streams, streaming pipeline | ~1-1.5s | ~$0.50-1.00 |
 
-Twilio voice is ~$0.0085/min; Media Streams ~$0.002/min. STT via local
-Whisper is free. A cloud LLM brain is fractions of a cent per call at
-small-model prices.
+Twilio voice ~$0.0085/min. A cloud LLM brain is fractions of a cent per
+call at small-model prices.
 
 ## Infrastructure
 
-The voice server needs a public IP and modest CPU. Oracle Cloud's Always
-Free tier fits: 2 Ampere ARM OCPUs + 12GB RAM (as of mid-2026; was 4/24GB
-before Oracle halved it). Keep a heartbeat running — Oracle reclaims
-instances idle under 20% for 7 days.
+Any variant needing a public `wss://` endpoint (2 and 3) needs a public
+server. Options, cheapest first:
+
+- **Oracle Cloud Always Free** — 2 ARM OCPUs + 12GB RAM, free forever.
+  Best specs. Reclaims instances idle under 20% for 7 days, so keep a
+  heartbeat. (Allowance halved June 2026; was 4/24GB.)
+- **Google Cloud e2-micro** — 0.25 vCPU + 1GB, free forever in US
+  regions. Thin, but a text-relay websocket fits.
+- **Railway** — ~$5/mo Hobby. Easiest deploy (git push → public URL),
+  zero ops. Free plan's $1 credit is borderline for always-on.
+
+Not suitable: Cloudflare Workers free tier (10ms CPU/request; Durable
+Objects, needed for websockets, aren't free). Sandbox VMs with no
+inbound networking (Cloudflare Tunnel blocked on outbound 7844 too).
+
+## SMS
+
+Sending and receiving texts needs no public endpoint — the REST API
+covers both directions. Poll `GET /Messages.json` for inbound.
 
 ## Reference implementation
 
-`server.py` (in this repo's companion workspace): asyncio websocket
-server, Twilio Media Streams protocol, Whisper transcription, pluggable
-brain (`stub` / cloud LLM), TTS to mulaw. Written against the sandbox;
+`server.py` (companion workspace): asyncio websocket server, Twilio
+Media Streams protocol, Whisper transcription, pluggable brain
+(`stub` / cloud LLM), TTS to mulaw. Written against the sandbox;
 needs a public host to run live.
+
+`tw.py` turn-based commands: `ask` (call + speak + record),
+`recordings`, `rec-audio`, `say` (redirect live call with reply).
 
 ## Lessons
 
 - Twilio's `<Say>` and inline TwiML make one-way voice trivial. Two-way
   is where the work is.
-- The sandbox firewall blocked Cloudflare Tunnel (QUIC/UDP and TCP 7844
-  refused). Don't assume you can get a public endpoint from anywhere.
+- `<Say>` defaults to female; `voice="Polly.Matthew"` fixes it with no
+  latency cost. (Don't wire a custom TTS + `<Play>` for turn-based —
+  it adds seconds for no benefit.)
+- Whisper tiny is fast but garbles phone audio. Size up the model or
+  use cloud STT when accuracy matters.
+- The sandbox firewall blocked Cloudflare Tunnel (QUIC/UDP and TCP
+  7844 refused). Don't assume you can get a public endpoint from
+  anywhere.
 - Local LLM inference on 2 vCPUs is ~60s/reply for a 0.5B model. The
   brain must be a cloud API for anything real-time.
 - faster-whisper's bundled HTTP client chokes on bracketed IPv6
-  `no_proxy` entries; unset `no_proxy`/`NO_PROXY` or download model files
-  with curl directly.
+  `no_proxy` entries; unset `no_proxy`/`NO_PROXY` before loading.
 - TTS WAV output may carry an ID3 header; strip it before decoding.
